@@ -1,0 +1,157 @@
+# Copyright (c) 2022-2023, NVIDIA CORPORATION. All rights reserved.
+#
+# NVIDIA CORPORATION及其 licensors保留此软件、相关文档及其修改的所有知识产权和专有权利。
+# 未经NVIDIA CORPORATION明确许可协议，任何使用、复制、披露或分发此软件和相关文档的行为均被严格禁止。
+#
+
+import os
+
+import carb
+#add by lxy
+import omni.usd
+import numpy as np
+from isaacsim.core.prims import SingleArticulation as Articulation
+from isaacsim.core.prims import SingleXFormPrim as XFormPrim
+from isaacsim.core.utils.extensions import get_extension_path_from_name
+from isaacsim.core.utils.nucleus import get_assets_root_path
+from isaacsim.core.utils.numpy.rotations import euler_angles_to_quats
+from isaacsim.core.utils.stage import add_reference_to_stage
+from isaacsim.robot_motion.motion_generation import (
+    ArticulationKinematicsSolver,
+    LulaKinematicsSolver,
+    interface_config_loader,
+)
+
+
+class FrankaKinematicsExample:
+    def __init__(self):
+        self._kinematics_solver = None
+        self._articulation_kinematics_solver = None
+
+        self._articulation = None
+        self._target = None
+
+    def load_example_assets(self):
+        # Add the Franka and target to the stage
+        # 向舞台添加Franka机器人和目标物体
+
+        robot_prim_path = "/panda"
+        path_to_robot_usd = get_assets_root_path() + "/Isaac/Robots/Franka/franka.usd"
+
+        add_reference_to_stage(path_to_robot_usd, robot_prim_path)
+        self._articulation = Articulation(robot_prim_path)
+
+
+        # ==== 最终物理参数设置 ====，LXY
+        from pxr import PhysxSchema
+        stage = omni.usd.get_context().get_stage()
+        physics_scene = PhysxSchema.PhysxSceneAPI.Get(stage, "/physicsScene")
+        if physics_scene:
+            physics_scene.CreateSolverPositionIterationCountAttr().Set(64)
+
+
+
+        # ==== 最终正确的延迟初始化 ====
+        def _delayed_init():
+            from omni.isaac.core.utils.prims import is_prim_path_valid
+            if not is_prim_path_valid("/panda"):
+                carb.log_warn("继续等待机械臂加载...")
+                # 使用Isaac Core工具函数
+                from omni.isaac.core.utils.timers import add_timed_callback
+                add_timed_callback(0.5, _delayed_init)  # 0.5秒后重试
+                return
+
+            if self._articulation.initialize():
+                carb.log_info("初始化成功")
+                self.setup()
+            else:
+                carb.log_error("初始化失败")
+
+        # 初始延迟0.5秒
+        from omni.isaac.core.utils.timers import add_timed_callback
+        add_timed_callback(0.5, _delayed_init)
+
+        add_reference_to_stage(get_assets_root_path() + "/Isaac/Props/UIElements/frame_prim.usd", "/World/target")
+        self._target = XFormPrim("/World/target", scale=[0.04, 0.04, 0.04])
+        self._target.set_default_state(np.array([0.3, 0, 0.5]), euler_angles_to_quats([0, np.pi, 0]))
+
+        # Return assets that were added to the stage so that they can be registered with the core.World
+        # 返回添加到舞台的资产，以便它们可以被core.World注册
+        return self._articulation, self._target
+
+    def setup(self):
+        # Load a URDF and Lula Robot Description File for this robot:
+        # 加载此机器人的URDF文件和Lula机器人描述文件：
+        mg_extension_path = get_extension_path_from_name("isaacsim.robot_motion.motion_generation")
+        kinematics_config_dir = os.path.join(mg_extension_path, "motion_policy_configs")
+
+        self._kinematics_solver = LulaKinematicsSolver(
+            robot_description_path=kinematics_config_dir + "/franka/rmpflow/robot_descriptor.yaml",
+            #robot_description_path=kinematics_config_dir + "/work/test.yaml",
+            urdf_path=kinematics_config_dir + "/franka/lula_franka_gen.urdf",
+        )
+
+        # Kinematics for supported robots can be loaded with a simpler equivalent
+        # 可以使用更简单的等价方法加载受支持机器人对应的运动学配置
+        # print("Supported Robots with a Lula Kinematics Config:", interface_config_loader.get_supported_robots_with_lula_kinematics())
+        # kinematics_config = interface_config_loader.load_supported_lula_kinematics_solver_config("Franka")
+        # self._kinematics_solver = LulaKinematicsSolver(**kinematics_config)
+
+        print("Valid frame names at which to compute kinematics:", self._kinematics_solver.get_all_frame_names())
+        # 打印有效的坐标系名称，用于计算运动学
+
+        end_effector_name = "right_gripper"
+        self._articulation_kinematics_solver = ArticulationKinematicsSolver(
+            self._articulation, self._kinematics_solver, end_effector_name
+        )
+
+
+        # ==== 最终修复 ==== add by lxy
+        # 正确获取关节名称列表（去掉括号）
+        dof_names = self._articulation.dof_names  # 注意此处去除了()
+        
+        # 确保关节已初始化
+        if not dof_names:
+            carb.log_error("Articulation joints not initialized!")
+            return
+
+        # 设置驱动参数
+        for name in dof_names:
+            if not self._articulation.find_dof(name):
+                continue
+            dof_index = self._articulation.get_dof_index(name)
+            self._articulation.set_dof_drive_type(dof_index, "position")
+            self._articulation.set_dof_position_gains(dof_index, 1.0e3)
+            self._articulation.set_dof_velocity_gains(dof_index, 1.0e2)
+
+    def update(self, step: float):
+        target_position, target_orientation = self._target.get_world_pose()
+        # 获取目标物体的世界坐标系位置和方向
+        print(f"当前关节位置误差: {np.max(np.abs(action.joint_positions - self._articulation.get_joint_positions()))}")
+
+        # Track any movements of the robot base
+        # 追踪机器人基座的任何移动
+        robot_base_translation, robot_base_orientation = self._articulation.get_world_pose()
+        self._kinematics_solver.set_robot_base_pose(robot_base_translation, robot_base_orientation)
+
+        action, success = self._articulation_kinematics_solver.compute_inverse_kinematics(
+            target_position, target_orientation
+        )
+
+        if success:
+            # 添加重力补偿验证,add by lxy
+            action.joint_efforts = self._articulation_kinematics_solver.compute_gravity_compensation()
+            self._articulation.apply_action(action)
+        else:
+            carb.log_warn("IK did not converge to a solution.  No action is being taken")
+            # IK未收敛到解决方案。没有动作被执行
+
+        # Unused Forward Kinematics:
+        # 未使用的正运动学：
+        # ee_position,ee_rot_mat = articulation_kinematics_solver.compute_end_effector_pose()
+       
+
+    def reset(self):
+        # Kinematics is stateless
+        # 运动学是无状态的
+        pass
